@@ -1,0 +1,17 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+node_modules/
+yolov8n.pt
+yolov8s.pt
+yolov8m.pt
