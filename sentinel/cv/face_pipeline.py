@@ -58,7 +58,7 @@ def _open_camera(url: str = "") -> cv2.VideoCapture:
         return cap
 
     logger.info("GStreamer failed, falling back to /dev/video0")
-    cap = cv2.VideoCapture(CAMERA_DEVICE)
+    cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     return cap
