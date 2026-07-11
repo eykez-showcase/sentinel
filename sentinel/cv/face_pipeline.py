@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 """
-FacePipeline: reads from the Jetson's local camera, runs face detection
-and recognition, annotates frames, and serves them as MJPEG.
+FacePipeline: reads from the Jetson's CSI camera via GStreamer subprocess,
+runs face detection and recognition, annotates frames, and serves them as MJPEG.
+
+Uses a GStreamer pipeline piped to stdout since OpenCV on this system was built
+without GStreamer support.
 
 Events emitted (throttled to once per 60s per identity):
   - face_recognized  → known family member
@@ -11,9 +14,9 @@ Events emitted (throttled to once per 60s per identity):
 
 import asyncio
 import logging
+import subprocess
 import time
 from datetime import datetime, timezone
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -25,43 +28,45 @@ from sentinel.schemas.event import EventRead
 
 logger = logging.getLogger(__name__)
 
-# How long between repeated events for the same identity (seconds)
 EVENT_THROTTLE = 60
-# Target FPS for face pipeline
 TARGET_FPS = 10
+WIDTH = 1920
+HEIGHT = 1080
+FRAME_BYTES = WIDTH * HEIGHT * 3
+
+GST_CMD = [
+    "gst-launch-1.0", "-q",
+    "nvarguscamerasrc", "sensor-id=0", "!",
+    f"video/x-raw(memory:NVMM),width={WIDTH},height={HEIGHT},framerate=30/1", "!",
+    "nvvidconv", "!",
+    "video/x-raw,format=BGRx", "!",
+    "videoconvert", "!",
+    f"video/x-raw,format=BGR", "!",
+    "fdsink", "fd=1",
+]
+
+# RTSP fallback command template
+def _rtsp_cmd(url: str) -> list[str]:
+    return [
+        "gst-launch-1.0", "-q",
+        "rtspsrc", f"location={url}", "latency=0", "!",
+        "rtph264depay", "!",
+        "avdec_h264", "!",
+        "videoconvert", "!",
+        "video/x-raw,format=BGR", "!",
+        "fdsink", "fd=1",
+    ]
 
 
-def _open_camera(url: str = "") -> cv2.VideoCapture:
-    """
-    Open the face recognition camera.
-    - If url is an RTSP/HTTP URL, open that directly (drone camera, Wyze, etc.)
-    - Otherwise try GStreamer CSI, then fall back to /dev/video0.
-    """
-    if url and (url.startswith("rtsp://") or url.startswith("http")):
-        logger.info("Opening face camera from URL: %s", url)
-        cap = cv2.VideoCapture(url)
-        if cap.isOpened():
-            return cap
-        logger.warning("Could not open URL %s, falling back to local camera", url)
-
-    gst = (
-        "nvarguscamerasrc sensor-id=0 ! "
-        "video/x-raw(memory:NVMM), width=(int)1920, height=(int)1080, framerate=(fraction)30/1 ! "
-        "nvvidconv flip-method=0 ! "
-        "video/x-raw, width=(int)960, height=(int)540, format=(string)BGRx ! "
-        "videoconvert ! "
-        "video/x-raw, format=(string)BGR ! appsink drop=1"
-    )
-    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-    if cap.isOpened():
-        logger.info("Opened camera via GStreamer nvarguscamerasrc")
-        return cap
-
-    logger.info("GStreamer failed, falling back to /dev/video0")
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    return cap
+def _read_frame(proc: subprocess.Popen) -> np.ndarray | None:
+    """Read one raw BGR frame from the GStreamer subprocess stdout."""
+    raw = b""
+    while len(raw) < FRAME_BYTES:
+        chunk = proc.stdout.read(FRAME_BYTES - len(raw))
+        if not chunk:
+            return None
+        raw += chunk
+    return np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
 
 
 class FacePipeline:
@@ -78,14 +83,11 @@ class FacePipeline:
         self._running = False
         self._task: asyncio.Task | None = None
 
-        # Latest annotated JPEG bytes for MJPEG streaming
         self._latest_frame: bytes | None = None
         self._frame_lock = asyncio.Lock()
 
-        # Throttle: identity_key → last event time
         self._last_event: dict[str, float] = {}
 
-        # Current status for the dashboard
         self.last_seen_name: str | None = None
         self.last_seen_role: str | None = None
         self.last_seen_confidence: float = 0.0
@@ -117,29 +119,34 @@ class FacePipeline:
         loop = asyncio.get_running_loop()
         interval = 1.0 / TARGET_FPS
 
-        cap = await loop.run_in_executor(None, _open_camera, settings.face_camera_url)
-        if not cap.isOpened():
-            logger.error("FacePipeline: cannot open camera device")
-            return
+        url = settings.face_camera_url
+        cmd = _rtsp_cmd(url) if url.startswith("rtsp://") else GST_CMD
+        logger.info("FacePipeline opening camera with: %s", cmd[0])
 
+        proc = None
         try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            logger.info("FacePipeline GStreamer process started (pid=%d)", proc.pid)
+
             while self._running:
                 tick = loop.time()
-                ret, frame = await loop.run_in_executor(None, cap.read)
-                if not ret:
-                    await asyncio.sleep(1)
-                    continue
 
+                frame = await loop.run_in_executor(None, _read_frame, proc)
+                if frame is None:
+                    logger.warning("FacePipeline: lost camera feed, restarting in 2s")
+                    await asyncio.sleep(2)
+                    break
+
+                # Scale down for processing (960x540) while keeping full-res for display
+                small = cv2.resize(frame, (960, 540))
                 annotated, results = await loop.run_in_executor(
-                    None, self._process_frame, frame
+                    None, self._process_frame, small
                 )
 
-                # Encode to JPEG
                 _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 async with self._frame_lock:
                     self._latest_frame = buf.tobytes()
 
-                # Emit events for new detections
                 for person_id, name, role, confidence in results:
                     await self._maybe_emit_event(person_id, name, role, confidence)
 
@@ -147,23 +154,28 @@ class FacePipeline:
                 sleep = interval - elapsed
                 if sleep > 0:
                     await asyncio.sleep(sleep)
+
         except asyncio.CancelledError:
             pass
         except Exception:
             logger.exception("FacePipeline error")
         finally:
-            cap.release()
+            if proc:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
     def _process_frame(
         self, frame: np.ndarray
     ) -> tuple[np.ndarray, list[tuple[str | None, str | None, str | None, float]]]:
-        """Detect faces, run recognition, annotate frame. Returns (annotated, results)."""
         results: list[tuple[str | None, str | None, str | None, float]] = []
 
         if not self._recognizer.available:
             cv2.putText(
-                frame, "Face recognition not available",
-                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2
+                frame, "Face recognition unavailable — install insightface",
+                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
             )
             return frame, results
 
@@ -175,13 +187,9 @@ class FacePipeline:
         for face in faces:
             x1, y1, x2, y2 = [int(v) for v in face.bbox]
             emb = face.normed_embedding.astype(np.float32)
-
-            # Match against stored embeddings
             person_id, name, role, confidence = self._recognizer._match_embedding(emb)
-
             results.append((person_id, name, role, confidence))
 
-            # Choose color: green = known family, yellow = known other, red = unknown
             if person_id and role == "family":
                 color = (0, 200, 0)
                 label = f"{name} ({confidence:.0%})"
@@ -193,13 +201,11 @@ class FacePipeline:
                 label = "Unknown"
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            # Label background
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
             cv2.putText(frame, label, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            # Update live status
             self.last_seen_name = name or "Unknown"
             self.last_seen_role = role
             self.last_seen_confidence = confidence
