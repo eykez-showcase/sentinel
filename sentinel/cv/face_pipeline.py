@@ -27,14 +27,23 @@ logger = logging.getLogger(__name__)
 
 # How long between repeated events for the same identity (seconds)
 EVENT_THROTTLE = 60
-# Camera device
-CAMERA_DEVICE = 0
 # Target FPS for face pipeline
 TARGET_FPS = 10
 
 
-def _open_camera() -> cv2.VideoCapture:
-    """Try GStreamer nvarguscamerasrc first, fall back to v4l2."""
+def _open_camera(url: str = "") -> cv2.VideoCapture:
+    """
+    Open the face recognition camera.
+    - If url is an RTSP/HTTP URL, open that directly (drone camera, Wyze, etc.)
+    - Otherwise try GStreamer CSI, then fall back to /dev/video0.
+    """
+    if url and (url.startswith("rtsp://") or url.startswith("http")):
+        logger.info("Opening face camera from URL: %s", url)
+        cap = cv2.VideoCapture(url)
+        if cap.isOpened():
+            return cap
+        logger.warning("Could not open URL %s, falling back to local camera", url)
+
     gst = (
         "nvarguscamerasrc sensor-id=0 ! "
         "video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1 ! "
@@ -103,10 +112,11 @@ class FacePipeline:
             return self._latest_frame
 
     async def _run(self) -> None:
+        from sentinel.core.config import settings
         loop = asyncio.get_running_loop()
         interval = 1.0 / TARGET_FPS
 
-        cap = await loop.run_in_executor(None, _open_camera)
+        cap = await loop.run_in_executor(None, _open_camera, settings.face_camera_url)
         if not cap.isOpened():
             logger.error("FacePipeline: cannot open camera device")
             return

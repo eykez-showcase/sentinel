@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o"
     ai_summary_max_events: int = 20
 
+    # Face recognition camera (local device index, RTSP URL, or leave empty for /dev/video0)
+    face_camera_url: str = ""
+
     # WebSocket
     ws_heartbeat_interval: int = 30
 
