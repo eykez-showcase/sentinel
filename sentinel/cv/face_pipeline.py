@@ -15,6 +15,7 @@ Events emitted (throttled to once per 60s per identity):
 import asyncio
 import logging
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -58,15 +59,43 @@ def _rtsp_cmd(url: str) -> list[str]:
     ]
 
 
-def _read_frame(proc: subprocess.Popen) -> np.ndarray | None:
-    """Read one raw BGR frame from the GStreamer subprocess stdout."""
-    raw = b""
-    while len(raw) < FRAME_BYTES:
-        chunk = proc.stdout.read(FRAME_BYTES - len(raw))
-        if not chunk:
-            return None
-        raw += chunk
-    return np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
+class FrameReader:
+    """
+    Continuously drains the GStreamer pipe in a background thread,
+    keeping only the latest frame to prevent pipe buffer deadlock.
+    """
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self._proc = proc
+        self._latest: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._alive = True
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        while self._alive:
+            raw = b""
+            while len(raw) < FRAME_BYTES:
+                chunk = self._proc.stdout.read(FRAME_BYTES - len(raw))
+                if not chunk:
+                    self._alive = False
+                    return
+                raw += chunk
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
+            with self._lock:
+                self._latest = frame
+
+    def read(self) -> np.ndarray | None:
+        with self._lock:
+            return self._latest.copy() if self._latest is not None else None
+
+    @property
+    def alive(self) -> bool:
+        return self._alive
+
+    def stop(self) -> None:
+        self._alive = False
 
 
 class FacePipeline:
@@ -124,18 +153,24 @@ class FacePipeline:
         logger.info("FacePipeline opening camera with: %s", cmd[0])
 
         proc = None
+        reader = None
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             logger.info("FacePipeline GStreamer process started (pid=%d)", proc.pid)
+            reader = FrameReader(proc)
 
             while self._running:
                 tick = loop.time()
 
-                frame = await loop.run_in_executor(None, _read_frame, proc)
-                if frame is None:
+                if not reader.alive:
                     logger.warning("FacePipeline: lost camera feed, restarting in 2s")
                     await asyncio.sleep(2)
                     break
+
+                frame = await loop.run_in_executor(None, reader.read)
+                if frame is None:
+                    await asyncio.sleep(0.05)
+                    continue
 
                 # Scale down for processing (960x540) while keeping full-res for display
                 small = cv2.resize(frame, (960, 540))
@@ -160,6 +195,8 @@ class FacePipeline:
         except Exception:
             logger.exception("FacePipeline error")
         finally:
+            if reader:
+                reader.stop()
             if proc:
                 proc.terminate()
                 try:
