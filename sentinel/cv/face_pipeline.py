@@ -18,6 +18,7 @@ import numpy as np
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from sentinel.core.events import EventBus
+from sentinel.cv.audio_alerter import AudioAlerter
 from sentinel.models.event import Event
 from sentinel.schemas.event import EventRead
 
@@ -111,6 +112,7 @@ class FacePipeline:
         self._overlay_lock = threading.Lock()
 
         self._last_event: dict[str, float] = {}
+        self._audio = AudioAlerter()
 
         self.last_seen_name: str | None = None
         self.last_seen_role: str | None = None
@@ -290,6 +292,14 @@ class FacePipeline:
         if now - self._last_event.get(identity_key, 0) < EVENT_THROTTLE:
             return
         self._last_event[identity_key] = now
+
+        # Audio alert
+        if not person_id:
+            self._audio.alert_unknown()
+        elif role == "family":
+            self._audio.alert_family(name)
+        else:
+            self._audio.alert_known(name)
 
         event_type = "face_recognized" if person_id else "unknown_face"
         severity = "low" if (person_id and role == "family") else "high"
