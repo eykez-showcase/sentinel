@@ -121,6 +121,8 @@ class FacePipeline:
         self.last_seen_role: str | None = None
         self.last_seen_confidence: float = 0.0
         self.last_seen_at: str | None = None
+        self._frame_count = 0
+        self._last_results: list = []  # reuse last recognition results between frames
 
     async def start(self) -> None:
         if self._running:
@@ -172,17 +174,23 @@ class FacePipeline:
                     await asyncio.sleep(0.05)
                     continue
 
-                # Scale down for processing (960x540) while keeping full-res for display
+                self._frame_count += 1
                 small = cv2.resize(frame, (960, 540))
-                annotated, results = await loop.run_in_executor(
-                    None, self._process_frame, small
-                )
 
-                _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                # Run face recognition every 5th frame to keep stream smooth on CPU
+                if self._frame_count % 5 == 0:
+                    annotated, self._last_results = await loop.run_in_executor(
+                        None, self._process_frame, small
+                    )
+                else:
+                    # Just encode the frame without running recognition
+                    annotated = small
+
+                _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 async with self._frame_lock:
                     self._latest_frame = buf.tobytes()
 
-                for person_id, name, role, confidence in results:
+                for person_id, name, role, confidence in self._last_results:
                     await self._maybe_emit_event(person_id, name, role, confidence)
 
                 elapsed = loop.time() - tick
