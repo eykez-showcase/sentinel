@@ -151,64 +151,67 @@ class FacePipeline:
         url = settings.face_camera_url
         cmd = _rtsp_cmd(url) if url.startswith("rtsp://") else GST_CMD
 
-        proc = None
-        reader = None
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            logger.info("FacePipeline camera process started (pid=%d)", proc.pid)
-            reader = FrameReader(proc)
+        while self._running:
+            proc = None
+            reader = None
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                logger.info("FacePipeline camera process started (pid=%d)", proc.pid)
+                reader = FrameReader(proc)
 
-            while self._running:
-                tick = loop.time()
+                while self._running:
+                    tick = loop.time()
 
-                if not reader.alive:
-                    logger.warning("FacePipeline: camera died, restarting in 3s")
-                    await asyncio.sleep(3)
-                    break
+                    if not reader.alive:
+                        logger.warning("FacePipeline: camera died, restarting in 3s")
+                        break
 
-                frame = reader.read()
-                if frame is None:
-                    await asyncio.sleep(0.05)
-                    continue
+                    frame = reader.read()
+                    if frame is None:
+                        await asyncio.sleep(0.05)
+                        continue
 
-                # Share raw frame with recognition task
-                with self._raw_lock:
-                    self._latest_raw = frame
+                    # Share raw frame with recognition task
+                    with self._raw_lock:
+                        self._latest_raw = frame
 
-                # Scale for streaming
-                display = cv2.resize(frame, (960, 540))
+                    # Scale for streaming
+                    display = cv2.resize(frame, (960, 540))
 
-                # Draw cached recognition overlays (from last recognition run)
-                with self._overlay_lock:
-                    for x1, y1, x2, y2, label, color in self._overlays:
-                        cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                        cv2.rectangle(display, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-                        cv2.putText(display, label, (x1 + 2, y1 - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    # Draw cached recognition overlays (from last recognition run)
+                    with self._overlay_lock:
+                        for x1, y1, x2, y2, label, color in self._overlays:
+                            cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+                            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                            cv2.rectangle(display, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+                            cv2.putText(display, label, (x1 + 2, y1 - 4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                _, buf = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                async with self._frame_lock:
-                    self._latest_frame = buf.tobytes()
+                    _, buf = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                    async with self._frame_lock:
+                        self._latest_frame = buf.tobytes()
 
-                elapsed = loop.time() - tick
-                sleep = interval - elapsed
-                if sleep > 0:
-                    await asyncio.sleep(sleep)
+                    elapsed = loop.time() - tick
+                    sleep = interval - elapsed
+                    if sleep > 0:
+                        await asyncio.sleep(sleep)
 
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("FacePipeline stream error")
-        finally:
-            if reader:
-                reader.stop()
-            if proc:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("FacePipeline stream error")
+            finally:
+                if reader:
+                    reader.stop()
+                if proc:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+
+            if self._running:
+                await asyncio.sleep(3)
 
     # ------------------------------------------------------------------ #
     # Recognition loop — runs insightface every second, updates overlays  #
